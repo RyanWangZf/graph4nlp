@@ -1,5 +1,6 @@
 import argparse
 import os
+
 import time
 import numpy as np
 import torch
@@ -29,7 +30,80 @@ from graph4nlp.pytorch.modules.utils import constants as Constants
 from graph4nlp.pytorch.modules.utils.generic_utils import EarlyStopping, grid, to_cuda
 from graph4nlp.pytorch.modules.utils.logger import Logger
 
+
+from movie import MovieDataset
+from graph4nlp.pytorch.modules.prediction.classification.graph_classification.feedforward_nn import GraphClassifierBase, GraphClassifierLayerBase
+from graph4nlp.pytorch.modules.prediction.classification.graph_classification.avg_pooling import AvgPooling
+from graph4nlp.pytorch.modules.prediction.classification.graph_classification.max_pooling import MaxPooling
+from graph4nlp.pytorch.modules.prediction.classification.graph_classification.feedforward_nn import FeedForwardNNLayer
+from sklearn.metrics import r2_score
+import pdb
+
+
+# import argparse
+# parser = argparse.ArgumentParser(description='GPU ID')
+# parser.add_argument('--gpu', type=str, help='Used GPU IDX')
+# args = parser.parse_args()
+
+# os.environ['CUDA_VISIBLE_DEVICES'] = f'{args.gpu}'
+
 torch.multiprocessing.set_sharing_strategy("file_system")
+
+class FeedForwardNN(GraphClassifierBase):
+    r"""FeedForwardNN class for graph classification task.
+
+    Parameters
+    ----------
+    input_size : int
+        The dimension of input graph embeddings.
+    num_class : int
+        The number of classes for classification.
+    hidden_size : list of int
+        Hidden size per NN layer.
+    activation: nn.Module, optional
+        The activation function, default: `nn.ReLU()`.
+    """
+
+    def __init__(
+        self,
+        input_size,
+        num_class,
+        hidden_size,
+        activation=None,
+        graph_pool_type="max_pool",
+        **kwargs
+    ):
+        super(FeedForwardNN, self).__init__()
+
+        if not activation:
+            activation = nn.ReLU()
+
+        if graph_pool_type == "avg_pool":
+            self.graph_pool = AvgPooling()
+        elif graph_pool_type == "max_pool":
+            self.graph_pool = MaxPooling(**kwargs)
+        else:
+            raise RuntimeError("Unknown graph pooling type: {}".format(graph_pool_type))
+
+        self.classifier = FeedForwardNNLayer(input_size, 1, hidden_size, activation)
+
+    def forward(self, graph):
+        r"""Compute the logits tensor for graph classification.
+
+        Parameters
+        ----------
+        graph : GraphData
+            The graph data containing graph embeddings.
+
+        Returns
+        -------
+        list of GraphData
+            The output graph data containing logits tensor for graph classification.
+        """
+        graph_emb = self.graph_pool(graph, "node_emb")
+        logits = self.classifier(graph_emb)
+        graph.graph_attributes["logits"] = logits
+        return graph
 
 
 class TextClassifier(nn.Module):
@@ -192,7 +266,8 @@ class TextClassifier(nn.Module):
             use_linear_proj=config["max_pool_linear_proj"],
         )
 
-        self.loss = GeneralLoss("CrossEntropy")
+        # self.loss = GeneralLoss("CrossEntropy")
+        self.loss = nn.BCELoss()
 
     def forward(self, graph_list, tgt=None, require_loss=True):
         # graph embedding construction
@@ -203,10 +278,13 @@ class TextClassifier(nn.Module):
 
         # run graph classifier
         self.clf(batch_gd)
-        logits = batch_gd.graph_attributes["logits"]
+
+        logits = batch_gd.graph_attributes["logits"].squeeze().float()
+
+        pred_prob = logits.sigmoid()
 
         if require_loss:
-            loss = self.loss(logits, tgt)
+            loss = self.loss(pred_prob, tgt)
             return logits, loss
         else:
             return logits
@@ -284,8 +362,10 @@ class ModelHandler:
         if self.config["graph_type"] == "node_emb_refined":
             topology_subdir += "_{}".format(self.config["init_graph_type"])
 
-        dataset = TrecDataset(
-            root_dir=self.config.get("root_dir", "examples/pytorch/text_classification/data/trec"),
+
+        # use the movie review dataset
+        dataset = MovieDataset(
+            root_dir=self.config.get("root_dir", "examples/pytorch/text_classification/data/movie"),
             pretrained_word_emb_name=self.config.get("pretrained_word_emb_name", "840B"),
             pretrained_word_emb_cache_dir=self.config.get(
                 "pretrained_word_emb_cache_dir", ".vector_cache"
@@ -316,6 +396,7 @@ class ModelHandler:
             num_workers=self.config["num_workers"],
             collate_fn=dataset.collate_fn,
         )
+
         if not hasattr(dataset, "val"):
             dataset.val = dataset.test
         self.val_dataloader = DataLoader(
@@ -325,6 +406,7 @@ class ModelHandler:
             num_workers=self.config["num_workers"],
             collate_fn=dataset.collate_fn,
         )
+        
         self.test_dataloader = DataLoader(
             dataset.test,
             batch_size=self.config["batch_size"],
@@ -396,43 +478,37 @@ class ModelHandler:
                 self.optimizer.step()
                 train_loss.append(loss.item())
 
-                pred = torch.max(logits, dim=-1)[1].cpu()
-                train_acc.append(
-                    self.metric.calculate_scores(ground_truth=tgt.cpu(), predict=pred.cpu())[0]
-                )
                 dur.append(time.time() - t0)
 
-            val_acc = self.evaluate(self.val_dataloader)
-            self.scheduler.step(val_acc)
+            val_r2 = self.evaluate(self.val_dataloader)
+            self.scheduler.step(val_r2)
             print(
                 "Epoch: [{} / {}] | Time: {:.2f}s | Loss: {:.4f} |"
-                "Train Acc: {:.4f} | Val Acc: {:.4f}".format(
+                " Val R2: {:.4f}".format(
                     epoch + 1,
                     self.config["epochs"],
                     np.mean(dur),
                     np.mean(train_loss),
-                    np.mean(train_acc),
-                    val_acc,
+                    val_r2,
                 )
             )
             self.logger.write(
                 "Epoch: [{} / {}] | Time: {:.2f}s | Loss: {:.4f} |"
-                "Train Acc: {:.4f} | Val Acc: {:.4f}".format(
+                "Val R2: {:.4f}".format(
                     epoch + 1,
                     self.config["epochs"],
                     np.mean(dur),
                     np.mean(train_loss),
-                    np.mean(train_acc),
-                    val_acc,
+                    val_r2,
                 )
             )
 
-            if self.stopper.step(val_acc, self.model):
+            if self.stopper.step(val_r2, self.model):
                 break
 
         return self.stopper.best_score
 
-    def evaluate(self, dataloader):
+    def evaluate(self, dataloader, save_pred=False):
         self.model.eval()
         with torch.no_grad():
             pred_collect = []
@@ -444,24 +520,28 @@ class ModelHandler:
                 pred_collect.append(logits)
                 gt_collect.append(tgt)
 
-            pred_collect = torch.max(torch.cat(pred_collect, 0), dim=-1)[1].cpu()
+            # compute R2 score
             gt_collect = torch.cat(gt_collect, 0).cpu()
-            score = self.metric.calculate_scores(ground_truth=gt_collect, predict=pred_collect)[0]
+            pred_collect = torch.cat(pred_collect, 0).cpu()
+            pred_collect = pred_collect.sigmoid()
+            if save_pred:
+                np.save('eval_result.npy', {'pred':pred_collect.numpy(), 'gt': gt_collect.numpy()})
 
+            score = r2_score(gt_collect, pred_collect)
             return score
 
-    def test(self):
+    def test(self, save_pred=False):
         # restored best saved model
         self.model = TextClassifier.load_checkpoint(self.stopper.save_model_path)
 
         t0 = time.time()
-        acc = self.evaluate(self.test_dataloader)
+        acc = self.evaluate(self.test_dataloader, save_pred=save_pred)
         dur = time.time() - t0
         print(
-            "Test examples: {} | Time: {:.2f}s |  Test Acc: {:.4f}".format(self.num_test, dur, acc)
+            "Test examples: {} | Time: {:.2f}s |  Test R2 score: {:.4f}".format(self.num_test, dur, acc)
         )
         self.logger.write(
-            "Test examples: {} | Time: {:.2f}s |  Test Acc: {:.4f}".format(self.num_test, dur, acc)
+            "Test examples: {} | Time: {:.2f}s |  Test R2 score: {:.4f}".format(self.num_test, dur, acc)
         )
 
         return acc
@@ -497,6 +577,35 @@ def main(config):
 
     return val_acc, test_acc
 
+def main_eval(config):
+    # configure
+    np.random.seed(config["seed"])
+    torch.manual_seed(config["seed"])
+
+    if not config["no_cuda"] and torch.cuda.is_available():
+        print("[ Using CUDA ]")
+        config["device"] = torch.device("cuda" if config["gpu"] < 0 else "cuda:%d" % config["gpu"])
+        torch.cuda.manual_seed(config["seed"])
+        torch.cuda.manual_seed_all(config["seed"])
+        torch.backends.cudnn.deterministic = True
+        cudnn.benchmark = False
+    else:
+        config["device"] = torch.device("cpu")
+
+    print("\n" + config["out_dir"])
+
+    runner = ModelHandler(config)
+    t0 = time.time()
+
+    test_acc = runner.test(save_pred=True)
+
+    runtime = time.time() - t0
+    print("Total runtime: {:.2f}s".format(runtime))
+    runner.logger.write("Total runtime: {:.2f}s\n".format(runtime))
+    runner.logger.close()
+
+    return test_acc
+
 
 ################################################################################
 # ArgParse and Helper Functions #
@@ -507,8 +616,9 @@ def get_args():
         "-config", "--config", required=True, type=str, help="path to the config file"
     )
     parser.add_argument("--grid_search", action="store_true", help="flag: grid search")
+    parser.add_argument("--gpu", type=str, default='1')
+    parser.add_argument("--eval", action="store_true", help="flag: run evaluation only")
     args = vars(parser.parse_args())
-
     return args
 
 
@@ -571,9 +681,13 @@ if __name__ == "__main__":
         multiprocessing.set_start_method("spawn")
 
     cfg = get_args()
+    os.environ['CUDA_VISIBLE_DEVICES'] = '{}'.format(cfg['gpu'])
+    
     config = get_config(cfg["config"])
     print_config(config)
     if cfg["grid_search"]:
         grid_search_main(config)
+    elif cfg["eval"]:
+        main_eval(config)
     else:
         main(config)
